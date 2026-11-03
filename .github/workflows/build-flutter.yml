@@ -135,6 +135,10 @@ jobs:
             echo '::error::Payload mode=url wajib memiliki url website.'
             exit 1
           fi
+          if [[ "$WEB_URL" != https://* && "$WEB_URL" != http://* ]]; then
+            echo '::error::URL website harus diawali http:// atau https://'
+            exit 1
+          fi
           python3 - "$APP_NAME" "$WEB_URL" <<'PY'
           import json, pathlib, re, sys
           app_name, web_url = sys.argv[1], sys.argv[2]
@@ -154,12 +158,27 @@ jobs:
           WEB_URL_JSON="$(cat ../../web_url.json)"
           cat > lib/main.dart <<'DART'
           import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
           import 'package:webview_flutter/webview_flutter.dart';
 
           const String appTitle = __APP_NAME__;
           const String startUrl = __WEB_URL__;
 
-          void main() => runApp(const Web2ApkApp());
+          Future<void> setFullscreen() async {
+            await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+            await SystemChrome.setPreferredOrientations(const [
+              DeviceOrientation.portraitUp,
+              DeviceOrientation.portraitDown,
+              DeviceOrientation.landscapeLeft,
+              DeviceOrientation.landscapeRight,
+            ]);
+          }
+
+          void main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await setFullscreen();
+            runApp(const Web2ApkApp());
+          }
 
           class Web2ApkApp extends StatelessWidget {
             const Web2ApkApp({super.key});
@@ -178,19 +197,83 @@ jobs:
             State<WebHomePage> createState() => _WebHomePageState();
           }
 
-          class _WebHomePageState extends State<WebHomePage> {
+          class _WebHomePageState extends State<WebHomePage> with WidgetsBindingObserver {
             late final WebViewController controller;
+            bool loading = true;
+            bool hasError = false;
+
             @override
             void initState() {
               super.initState();
+              WidgetsBinding.instance.addObserver(this);
               controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                ..setNavigationDelegate(NavigationDelegate())
-                ..loadRequest(Uri.parse(startUrl));
+                ..setBackgroundColor(const Color(0xFFFFFFFF))
+                ..setNavigationDelegate(NavigationDelegate(
+                  onPageStarted: (_) {
+                    if (mounted) setState(() { loading = true; hasError = false; });
+                  },
+                  onPageFinished: (_) {
+                    if (mounted) setState(() { loading = false; hasError = false; });
+                  },
+                  onWebResourceError: (error) {
+                    // Ignore failed subresources; only show retry for main-frame errors.
+                    if (error.isForMainFrame == true && mounted) {
+                      setState(() { loading = false; hasError = true; });
+                    }
+                  },
+                  onNavigationRequest: (request) => NavigationDecision.navigate,
+                ));
+
+              controller.loadRequest(Uri.parse(startUrl));
             }
+
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState state) {
+              if (state == AppLifecycleState.resumed) setFullscreen();
+            }
+
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              super.dispose();
+            }
+
             @override
             Widget build(BuildContext context) => Scaffold(
-              body: SafeArea(child: WebViewWidget(controller: controller)),
+              backgroundColor: Colors.white,
+              body: SizedBox.expand(
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    WebViewWidget(controller: controller),
+                    if (loading)
+                      const IgnorePointer(
+                        child: Center(child: CircularProgressIndicator()),
+                      ),
+                    if (hasError)
+                      ColoredBox(
+                        color: Colors.white,
+                        child: Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text('Website gagal dimuat.'),
+                              const SizedBox(height: 12),
+                              ElevatedButton(
+                                onPressed: () {
+                                  setState(() { loading = true; hasError = false; });
+                                  controller.loadRequest(Uri.parse(startUrl));
+                                },
+                                child: const Text('Muat ulang'),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             );
           }
           DART
