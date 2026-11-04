@@ -202,6 +202,12 @@ jobs:
             bool loading = true;
             bool hasError = false;
 
+            Future<void> _reload() async {
+              if (!mounted) return;
+              setState(() { loading = true; hasError = false; });
+              await controller.loadRequest(Uri.parse(startUrl));
+            }
+
             @override
             void initState() {
               super.initState();
@@ -209,6 +215,7 @@ jobs:
               controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
                 ..setBackgroundColor(const Color(0xFFFFFFFF))
+                ..enableZoom(true)
                 ..setNavigationDelegate(NavigationDelegate(
                   onPageStarted: (_) {
                     if (mounted) setState(() { loading = true; hasError = false; });
@@ -217,8 +224,9 @@ jobs:
                     if (mounted) setState(() { loading = false; hasError = false; });
                   },
                   onWebResourceError: (error) {
-                    // Ignore failed subresources; only show retry for main-frame errors.
-                    if (error.isForMainFrame == true && mounted) {
+                    final errCode = error.errorCode;
+                    const fatalCodes = {-2, -6, -8, -14};
+                    if (error.isForMainFrame == true && fatalCodes.contains(errCode) && mounted) {
                       setState(() { loading = false; hasError = true; });
                     }
                   },
@@ -226,6 +234,14 @@ jobs:
                 ));
 
               controller.loadRequest(Uri.parse(startUrl));
+            }
+
+            Future<bool> _onWillPop() async {
+              if (await controller.canGoBack()) {
+                await controller.goBack();
+                return false;
+              }
+              return true;
             }
 
             @override
@@ -240,38 +256,46 @@ jobs:
             }
 
             @override
-            Widget build(BuildContext context) => Scaffold(
-              backgroundColor: Colors.white,
-              body: SizedBox.expand(
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    WebViewWidget(controller: controller),
-                    if (loading)
-                      const IgnorePointer(
-                        child: Center(child: CircularProgressIndicator()),
-                      ),
-                    if (hasError)
-                      ColoredBox(
-                        color: Colors.white,
-                        child: Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Text('Website gagal dimuat.'),
-                              const SizedBox(height: 12),
-                              ElevatedButton(
-                                onPressed: () {
-                                  setState(() { loading = true; hasError = false; });
-                                  controller.loadRequest(Uri.parse(startUrl));
-                                },
-                                child: const Text('Muat ulang'),
-                              ),
-                            ],
+            Widget build(BuildContext context) => PopScope(
+              canPop: false,
+              onPopInvokedWithResult: (didPop, _) async {
+                if (!didPop) await _onWillPop();
+              },
+              child: Scaffold(
+                backgroundColor: Colors.white,
+                body: SizedBox.expand(
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      WebViewWidget(controller: controller),
+                      if (loading)
+                        const IgnorePointer(
+                          child: ColoredBox(
+                            color: Colors.white,
+                            child: Center(child: CircularProgressIndicator()),
                           ),
                         ),
-                      ),
-                  ],
+                      if (hasError)
+                        ColoredBox(
+                          color: Colors.white,
+                          child: Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.wifi_off, size: 48, color: Colors.grey),
+                                const SizedBox(height: 12),
+                                const Text('Website gagal dimuat.'),
+                                const SizedBox(height: 12),
+                                ElevatedButton(
+                                  onPressed: _reload,
+                                  child: const Text('Muat ulang'),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             );
@@ -284,6 +308,39 @@ jobs:
           s = s.replace('__APP_NAME__', sys.argv[1]).replace('__WEB_URL__', sys.argv[2])
           p.write_text(s)
           PY
+
+          # FIX UTAMA: permission INTERNET wajib ada di manifest utama.
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>#' "$MANIFEST"
+          fi
+
+          WEB_URL_PLAIN="$(cat ../../web_url.json | jq -r '.')"
+          if [[ "$WEB_URL_PLAIN" == http://* ]]; then
+            echo '::warning::URL menggunakan http://_NETWORK_STATE"/>#' "$MANIFEST"
+          fi
+
+          WEB_URL_PLAIN="$(cat ../../web_url.json | jq -r '.')"
+          if [[ "$WEB_URL_PLAIN" == http://* ]]; then
+            echo '::warning::URL menggunakan http://, mengaktifkan cleartextTraffic.'
+            sed -i 's#<application#<application android:usesCleartextTraffic="true"#' "$MANIFEST"
+            mkdir -p android/app/src/main/res/xml
+            cat > android/app/src/main/res/xml/network_security_config.xml <<'NSC'
+          <?xml version="1.0" encoding="utf-8"?>
+          <network-security-config>
+              <base-config cleartextTrafficPermitted="true" />
+          </network-security-config>
+          NSC
+            sed -i 's#android:usesCleartextTraffic="true"#android:usesCleartextTraffic="true" android:networkSecurityConfig="@xml/network_security_config"#' "$MANIFEST"
+          fi
+
+          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            echo '::error::Gagal memasukkan permission INTERNET ke AndroidManifest.xml'
+            cat "$MANIFEST"
+            exit 1
+          fi
+          echo "AndroidManifest.xml final:"
+          cat "$MANIFEST"
           cd ../..
 
           if [[ -n "$ICON_URL" ]]; then
@@ -351,6 +408,19 @@ jobs:
           echo '::error::Project tidak dikenali. ZIP harus berisi pubspec.yaml (Flutter) atau gradlew/settings.gradle (Android Gradle).'
           find project_raw -maxdepth 4 -type f | head -100
           exit 1
+
+      - name: Ensure INTERNET permission (ZIP mode)
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PROJECT_DIR="${{ steps.detect.outputs.dir }}"
+          MANIFEST="$PROJECT_DIR/android/app/src/main/AndroidManifest.xml"
+          if [[ -f "$MANIFEST" ]] && ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            sed -i 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>#' "$MANIFEST"
+            echo "::warning::Permission INTERNET ditambahkan otomatis ke $MANIFEST"
+            grep -n 'uses-permission' "$MANIFEST" || true
+          fi
 
       - name: Setup Gradle for projects without wrapper
         if: steps.detect.outputs.type == 'gradle' && steps.detect.outputs.has_wrapper == 'false'
